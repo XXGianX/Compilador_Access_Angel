@@ -1,0 +1,17 @@
+# Ejemplo con condicional y operadores
+definir nota como 85
+definir aprobado como verdadero
+
+si nota es mayor que 70 entonces
+    mostrar "Felicitaciones, aprobaste"
+sino
+    mostrar "Necesitas estudiar mas"
+fin si
+
+# Uso de mientras
+definir x como 10
+mientras x es mayor que 0
+    definir x como x menos 2
+fin mientras
+
+mostrar "Fin del programa"

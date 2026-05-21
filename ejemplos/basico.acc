@@ -1,0 +1,7 @@
+# Ejemplo basico: declaracion y bucle
+definir contador como 1
+
+repetir 5 veces
+    mostrar contador
+    definir contador como contador mas 1
+fin repetir

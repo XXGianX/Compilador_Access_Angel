@@ -1,0 +1,8 @@
+# Ejemplo con errores lexicos intencionales
+definir precio como 99.5
+mostrar "El precio es: precio
+
+# Caracter invalido
+definir resultado como 10 @ 5
+
+mostrar resultado
