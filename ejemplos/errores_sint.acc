@@ -1,0 +1,25 @@
+# ============================================================
+# Archivo de prueba: errores sintacticos intencionales
+# Cada bloque tiene un error diferente documentado
+# ============================================================
+
+# ERROR 1: falta 'entonces' despues de la condicion del 'si'
+definir nota como 85
+si nota es mayor que 70
+    mostrar "aprobado"
+fin si
+
+# ERROR 2: falta 'como' en la declaracion
+definir resultado 42
+
+# ERROR 3: falta 'veces' en el bucle repetir
+repetir 3
+    mostrar "iteracion"
+fin repetir
+
+# ERROR 4: instruccion desconocida (no existe 'calcular')
+calcular base por altura
+
+# CORRECTO: esto si debe parsearse bien
+definir x como 10
+mostrar x
