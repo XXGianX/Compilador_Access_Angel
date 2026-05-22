@@ -4,6 +4,9 @@ build/
 # Entorno virtual de Python
 venv/
 
+# Modelos de voz (archivos grandes, se descargan con instalar.sh)
+voz/models/
+
 # Archivos temporales del sistema
 *.o
 *.a

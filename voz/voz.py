@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
 """
 Capa de voz para el Compilador Accesible
-Captura voz por micrófono → texto → ./compilador
-
-Comandos de voz especiales:
-  "nueva linea"         → inserta salto de línea en el buffer
-  "ejecutar/compilar"   → envía el buffer al compilador
-  "mostrar"             → muestra el código acumulado hasta ahora
-  "deshacer"            → elimina la última línea del buffer
-  "limpiar/borrar todo" → limpia el buffer
-  "salir/terminar"      → cierra el programa
+Motor: Vosk (offline, streaming) — el texto aparece mientras hablas,
+sin esperar a Google ni depender de internet.
 """
 
 import os
 import sys
-import speech_recognition as sr
+import json
+import unicodedata
 import subprocess
 import tempfile
 
-# ── Colores ANSI ────────────────────────────────────────────────────────────
+import pyaudio
+from vosk import Model, KaldiRecognizer, SetLogLevel
+
+SetLogLevel(-1)  # silencia logs internos de Vosk
+
+# ── Colores ANSI ──────────────────────────────────────────────────────────────
 R  = "\033[0m"
 B  = "\033[1m"
 RD = "\033[31m"
@@ -26,168 +25,240 @@ GN = "\033[32m"
 YL = "\033[33m"
 CY = "\033[36m"
 BL = "\033[34m"
+DM = "\033[2m"
 
-# ── Ruta al compilador (relativa al script: voz/ → build/compilador) ─────────
-DIR_BASE   = os.path.dirname(os.path.abspath(__file__))
-COMPILADOR = os.path.join(DIR_BASE, "..", "build", "compilador")
+# ── Rutas ─────────────────────────────────────────────────────────────────────
+_DIR       = os.path.dirname(os.path.abspath(__file__))
+COMPILADOR = os.path.join(_DIR, "..", "build", "compilador")
+MODEL_DIR  = os.path.join(_DIR, "models", "vosk-model-small-es-0.42")
 
-# ── Comandos de voz reconocidos ──────────────────────────────────────────────
+# ── Comandos de voz reconocidos ───────────────────────────────────────────────
 CMDS_EJECUTAR   = {"ejecutar", "compilar", "correr", "procesar"}
-CMDS_NUEVA_LINE = {"nueva linea", "nueva línea", "enter", "siguiente linea"}
-CMDS_MOSTRAR    = {"mostrar", "mostrar código", "ver código", "ver codigo"}
-CMDS_LIMPIAR    = {"limpiar", "borrar", "borrar todo", "limpiar todo", "reset"}
-CMDS_DESHACER   = {"deshacer", "borrar linea", "quitar última linea"}
-CMDS_SALIR      = {"salir", "terminar", "cerrar", "exit", "quitar"}
+CMDS_NUEVA_LINE = {"nueva linea", "enter", "siguiente linea", "salto"}
+CMDS_MOSTRAR    = {"mostrar codigo", "ver codigo", "que tengo"}
+CMDS_LIMPIAR    = {"limpiar", "borrar todo", "reset"}
+CMDS_DESHACER   = {"deshacer", "borrar linea", "undo"}
+CMDS_SALIR      = {"salir", "terminar", "cerrar", "exit"}
 
+# ── Configuración de audio ────────────────────────────────────────────────────
+SAMPLE_RATE = 16000   # Vosk requiere 16kHz mono
+CHUNK       = 4000    # 250ms de audio por lectura
+
+# ── Traducción fonética → símbolo ────────────────────────────────────────────
+# Vosk transcribe lo que escucha: "x" → "equis", 6 → "seis".
+# Estas tablas convierten el habla al símbolo real antes de meter al buffer.
+
+LETRAS_ES = {
+    "equis":  "x",  "jota":  "j",  "ka":    "k",  "ele":   "l",
+    "eme":    "m",  "ene":   "n",  "eñe":   "ñ",  "pe":    "p",
+    "erre":   "r",  "ese":   "s",  "te":    "t",  "uve":   "v",
+    "ye":     "y",  "zeta":  "z",  "hache": "h",  "efe":   "f",
+    "ce":     "c",  "ge":    "g",
+}
+
+NUMEROS_ES = {
+    "cero":      "0",
+    "uno":       "1",   "una":      "1",
+    "dos":       "2",
+    "tres":      "3",
+    "cuatro":    "4",
+    "cinco":     "5",
+    "seis":      "6",
+    "siete":     "7",
+    "ocho":      "8",
+    "nueve":     "9",
+    "diez":      "10",
+    "once":      "11",
+    "doce":      "12",
+    "trece":     "13",
+    "catorce":   "14",
+    "quince":    "15",
+    "veinte":    "20",
+    "treinta":   "30",
+    "cuarenta":  "40",
+    "cincuenta": "50",
+    "cien":      "100",
+}
+
+
+# ── Utilidades de texto ───────────────────────────────────────────────────────
+
+def quitar_tildes(texto: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFD", texto)
+        if unicodedata.category(c) != "Mn"
+    )
+
+def normalizar(texto: str) -> str:
+    return quitar_tildes(texto.lower().strip(" .,!¿?¡"))
+
+def traducir_a_codigo(texto: str) -> str:
+    """Convierte palabras habladas a símbolos de código: 'equis' → 'x', 'seis' → '6'."""
+    t = (texto
+         .replace("doble uve", "w")
+         .replace("doble ve",  "w")
+         .replace("i griega",  "y")
+         .replace("punto",     "."))
+    palabras = t.split()
+    return " ".join(
+        LETRAS_ES.get(p, NUMEROS_ES.get(p, p))
+        for p in palabras
+    )
+
+
+# ── UI ────────────────────────────────────────────────────────────────────────
 
 def banner():
     print(f"\n{BL}{B}  ╔══════════════════════════════════════╗")
     print(f"  ║   COMPILADOR ACCESIBLE — MODO VOZ    ║")
-    print(f"  ║   Habla tu código en español         ║")
+    print(f"  ║   Motor offline  •  Sin internet     ║")
     print(f"  ╚══════════════════════════════════════╝{R}\n")
-    print(f"{B}Comandos de voz disponibles:{R}")
-    print(f"  {CY}\"nueva linea\"{R}   → salto de línea en el código")
-    print(f"  {CY}\"ejecutar\"{R}      → envía el código al compilador")
-    print(f"  {CY}\"mostrar\"{R}       → muestra el código acumulado")
-    print(f"  {CY}\"deshacer\"{R}      → elimina la última línea")
-    print(f"  {CY}\"limpiar\"{R}       → borra todo el buffer")
-    print(f"  {CY}\"salir\"{R}         → cierra el programa\n")
-
+    print(f"{B}Comandos disponibles:{R}")
+    print(f"  {CY}\"nueva linea\"{R}    → inserta salto de línea")
+    print(f"  {CY}\"ejecutar\"{R}       → compila y muestra el AST")
+    print(f"  {CY}\"mostrar codigo\"{R} → imprime el buffer actual")
+    print(f"  {CY}\"deshacer\"{R}       → elimina la última línea")
+    print(f"  {CY}\"limpiar\"{R}        → vacía el buffer")
+    print(f"  {CY}\"salir\"{R}          → cierra el programa\n")
 
 def mostrar_buffer(buffer: list[str]):
     if not buffer:
-        print(f"{YL}(buffer vacío){R}")
+        print(f"\r{YL}  (buffer vacío){R}                              ")
         return
-    print(f"\n{B}── Código capturado ──────────────────────{R}")
+    print(f"\n{B}── Código acumulado ──────────────────────{R}")
     for i, linea in enumerate(buffer, 1):
-        print(f"  {BL}{i:2}.{R} {linea}")
+        print(f"  {BL}{i:2}.{R} {linea if linea else '(línea vacía)'}")
     print(f"{B}─────────────────────────────────────────{R}\n")
 
 
-def ejecutar_compilador(codigo: str) -> str:
-    """Escribe el código en un archivo temporal y llama al compilador."""
-    if not os.path.isfile(COMPILADOR):
-        return f"{RD}Error: no se encontró el compilador en '{COMPILADOR}'{R}"
+# ── Compilador ────────────────────────────────────────────────────────────────
 
+def ejecutar_compilador(codigo: str) -> str:
+    if not os.path.isfile(COMPILADOR):
+        return f"{RD}Error: ejecuta 'make' primero{R}"
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".acc", delete=False, encoding="utf-8"
     ) as f:
         f.write(codigo)
         ruta = f.name
-
     try:
-        result = subprocess.run(
-            [COMPILADOR, ruta],
-            capture_output=True, text=True, timeout=10
+        r = subprocess.run(
+            [COMPILADOR, ruta], capture_output=True, text=True, timeout=10
         )
-        salida = result.stdout
-        if result.returncode != 0 and result.stderr:
-            salida += result.stderr
-        return salida
+        return r.stdout + (r.stderr if r.returncode != 0 else "")
     except subprocess.TimeoutExpired:
-        return f"{RD}Error: el compilador tardó demasiado{R}"
+        return f"{RD}Timeout del compilador{R}"
     finally:
         os.unlink(ruta)
 
 
-def normalizar(texto: str) -> str:
-    """Minúsculas y elimina puntuación final."""
-    return texto.lower().strip(" .,!¿?")
+# ── Comandos ──────────────────────────────────────────────────────────────────
+
+def procesar_comando(norm: str, buffer: list[str]) -> bool:
+    if norm in CMDS_SALIR:
+        print(f"\n{BL}Cerrando. ¡Hasta luego!{R}\n")
+        sys.exit(0)
+    if norm in CMDS_NUEVA_LINE:
+        buffer.append("")
+        print(f"\r  {YL}↵ Nueva línea insertada{R}                         ")
+        return True
+    if norm in CMDS_MOSTRAR:
+        mostrar_buffer(buffer)
+        return True
+    if norm in CMDS_LIMPIAR:
+        buffer.clear()
+        print(f"\r  {YL}Buffer limpiado.{R}                                ")
+        return True
+    if norm in CMDS_DESHACER:
+        if buffer:
+            print(f"\r  {YL}Eliminada: '{buffer.pop()}'{R}                     ")
+        else:
+            print(f"\r  {YL}Buffer ya vacío.{R}                               ")
+        return True
+    if norm in CMDS_EJECUTAR:
+        if not buffer:
+            print(f"\r  {YL}No hay código aún. Habla primero.{R}              ")
+            return True
+        mostrar_buffer(buffer)
+        print(f"{B}── Compilando... ─────────────────────────{R}")
+        print(ejecutar_compilador("\n".join(buffer)))
+        buffer.clear()
+        return True
+    return False
 
 
-def escuchar(rec: sr.Recognizer, mic: sr.Microphone) -> str | None:
-    """Captura un fragmento de voz y lo convierte a texto."""
-    print(f"{GN}🎙  Escuchando...{R}", end=" ", flush=True)
-    try:
-        with mic as source:
-            audio = rec.listen(source, timeout=6, phrase_time_limit=8)
-        texto = rec.recognize_google(audio, language="es-ES")
-        print(f"{B}{texto}{R}")
-        return texto
-    except sr.WaitTimeoutError:
-        print(f"{YL}(silencio){R}")
-        return None
-    except sr.UnknownValueError:
-        print(f"{YL}(no se entendió){R}")
-        return None
-    except sr.RequestError as e:
-        print(f"{RD}Error de red: {e}{R}")
-        return None
-
+# ── Bucle principal ───────────────────────────────────────────────────────────
 
 def main():
-    # Verificar que el compilador exista
     if not os.path.isfile(COMPILADOR):
-        print(f"{RD}Error: primero ejecuta 'make' para compilar el proyecto.{R}")
+        print(f"{RD}Error: ejecuta 'make' primero para compilar el proyecto.{R}")
+        sys.exit(1)
+
+    if not os.path.isdir(MODEL_DIR):
+        print(f"{RD}Modelo de voz no encontrado.")
+        print(f"Ejecuta:  bash voz/instalar.sh{R}")
         sys.exit(1)
 
     banner()
 
-    rec = sr.Recognizer()
-    rec.pause_threshold   = 0.8   # segundos de silencio antes de cortar
-    rec.energy_threshold  = 300   # sensibilidad del micrófono
-    rec.dynamic_energy_threshold = True
+    print(f"{YL}Cargando modelo de voz...{R}", end=" ", flush=True)
+    model = Model(MODEL_DIR)
+    rec   = KaldiRecognizer(model, SAMPLE_RATE)
+    print(f"{GN}listo{R}\n")
 
-    # Calibración inicial del ruido ambiente
-    print(f"{YL}Calibrando micrófono (1 segundo de silencio)...{R}")
-    with sr.Microphone() as source:
-        rec.adjust_for_ambient_noise(source, duration=1)
-    print(f"{GN}Micrófono listo.{R}\n")
+    p      = pyaudio.PyAudio()
+    stream = p.open(
+        format=pyaudio.paInt16,
+        channels=1,
+        rate=SAMPLE_RATE,
+        input=True,
+        frames_per_buffer=CHUNK,
+    )
 
-    mic    = sr.Microphone()
-    buffer = []   # líneas de código acumuladas
+    print(f"{GN}🎙 Micrófono activo — habla cuando quieras.{R}\n")
 
-    while True:
-        texto = escuchar(rec, mic)
-        if texto is None:
-            continue
+    buffer: list[str] = []
 
-        norm = normalizar(texto)
+    try:
+        while True:
+            data = stream.read(CHUNK, exception_on_overflow=False)
 
-        # ── Comandos especiales ─────────────────────────────────────────────
-        if norm in CMDS_SALIR:
-            print(f"\n{BL}Cerrando el compilador de voz. ¡Hasta luego!{R}\n")
-            break
+            if rec.AcceptWaveform(data):
+                # Frase completa → procesar
+                texto = json.loads(rec.Result()).get("text", "").strip()
 
-        if norm in CMDS_NUEVA_LINE:
-            buffer.append("")
-            print(f"  {YL}↵ Nueva línea insertada{R}")
-            continue
+                if not texto:
+                    print(f"\r{GN}🎙{R} {DM}●{R}                                        ",
+                          end="", flush=True)
+                    continue
 
-        if norm in CMDS_MOSTRAR:
-            mostrar_buffer(buffer)
-            continue
+                norm = normalizar(texto)
+                print(f"\r{GN}🎙{R}  {B}{texto}{R}                                   ")
 
-        if norm in CMDS_LIMPIAR:
-            buffer.clear()
-            print(f"  {YL}Buffer limpiado.{R}")
-            continue
+                if procesar_comando(norm, buffer):
+                    continue
 
-        if norm in CMDS_DESHACER:
-            if buffer:
-                eliminada = buffer.pop()
-                print(f"  {YL}Línea eliminada: '{eliminada}'{R}")
+                linea = traducir_a_codigo(quitar_tildes(texto.strip().lower()))
+                buffer.append(linea)
+                print(f"  {CY}+{R} {B}'{linea}'{R}  {YL}← línea {len(buffer)}{R}")
+
             else:
-                print(f"  {YL}El buffer ya está vacío.{R}")
-            continue
+                # Resultado parcial — aparece mientras hablas (como el celular)
+                parcial = json.loads(rec.PartialResult()).get("partial", "")
+                if parcial:
+                    print(f"\r{GN}🎙{R}  {DM}{parcial}...{R}                               ",
+                          end="", flush=True)
+                else:
+                    print(f"\r{GN}🎙 ● Escuchando...{R}                               ",
+                          end="", flush=True)
 
-        if norm in CMDS_EJECUTAR:
-            if not buffer:
-                print(f"  {YL}No hay código que compilar. Habla primero.{R}")
-                continue
-            codigo = "\n".join(buffer)
-            print(f"\n{B}── Enviando al compilador ─────────────────{R}")
-            mostrar_buffer(buffer)
-            resultado = ejecutar_compilador(codigo)
-            print(resultado)
-            buffer.clear()
-            continue
-
-        # ── Línea de código normal ──────────────────────────────────────────
-        # Google puede devolver la línea con mayúscula inicial, la normalizamos
-        linea = texto.strip().lower()
-        buffer.append(linea)
-        print(f"  {CY}+{R} '{linea}' {YL}(línea {len(buffer)}){R}")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+        print(f"\n{BL}Cerrando. ¡Hasta luego!{R}\n")
 
 
 if __name__ == "__main__":
